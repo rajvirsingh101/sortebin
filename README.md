@@ -28,7 +28,6 @@ SORT E-BIN is a fully integrated, intelligent waste segregation system that comb
                                                                 ┌──────────────────────────┐
                                                                 │  Push Servo (BCM 27)     │
                                                                 │  90° → 150° → 90°       │
-                                                                │  (dispose waste)         │
                                                                 └──────────────────────────┘
                                                                            │
                                                                            ▼
@@ -66,7 +65,7 @@ SORT E-BIN is a fully integrated, intelligent waste segregation system that comb
 
 ## Servo Angle Calibration
 
-Angles were determined empirically during hardware integration and testing:
+Angles determined empirically during hardware integration and testing:
 
 | Category  | Selection Servo Angle |
 |-----------|-----------------------|
@@ -90,16 +89,18 @@ The system uses HSV colour-channel analysis for real-time inference on the Raspb
 
 If no category scores above threshold, defaults to No Waste.
 
+> **Model weights:** The TFLite model (`garbage_model.tflite`) was trained using Google Teachable Machine on custom campus waste images and runs on the Raspberry Pi at `/home/pi/ai_model/`. The weights file is not committed to this repo due to size. Contact the team for the model file.
+
 ---
 
 ## Repository Structure
 
 ```
 sortebin/
-├── main.py               # Full system control loop
-├── requirements.txt      # Python dependencies
-├── README.md
-└── report/               # Capstone project report (TIET, December 2025)
+├── main.py                  # Full system control loop
+├── requirements.txt         # Python dependencies
+├── CAPSTONE_CPG287.pdf      # Full project report (TIET, December 2025)
+└── README.md
 ```
 
 ---
@@ -110,6 +111,8 @@ sortebin/
 # On Raspberry Pi:
 sudo systemctl start pigpiod
 pip install -r requirements.txt
+
+# Place garbage_model.tflite and labels.txt at /home/pi/ai_model/
 python main.py
 ```
 
