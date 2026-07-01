@@ -1,247 +1,167 @@
 #!/usr/bin/env python3
 """
-SORT E-BIN — AI-Powered Smart Waste Sorting Bin
-Main control loop: USB camera → AI inference → servo actuation → LCD feedback
+SORT E-BIN -- AI-Powered Smart Waste Sorting Bin
+Main control loop -- matches system design from the capstone project report.
 
-Hardware:
-  - Raspberry Pi 4 Model B (4 GB RAM)
-  - USB Camera (640×480)
-  - 2× Servo motors via pigpio:
-      SERVO_SEL_PIN  (BCM 17) — rotates disc to category position
-      SERVO_PUSH_PIN (BCM 27) — pushes waste into selected bin
-  - I2C LCD 16×2 (address 0x27) via smbus2
-  - AI model: TFLite (Teachable Machine), categories: Plastic / Metal / Paper / No Waste
+Pipeline (report Section 4.1 flowchart):
+  1. IR sensor confirms disc is empty and ready.
+  2. User places waste on circular disc.
+  3. IR sensor detects waste presence -> triggers camera capture.
+  4. InceptionResNetV2 (TensorFlow/Keras) classifies waste on Raspberry Pi 4B.
+  5. Confidence >= 0.7 -> rotate disc to category angle, tilt to dispose.
+     Confidence < 0.7 -> default to 'others' bin (0 degrees).
+  6. Disc resets to home position for next cycle.
 
-B.E. Capstone Project — Computer Engineering, TIET Patiala, December 2025
+Model : InceptionResNetV2 fine-tuned on TrashNet + custom campus images.
+        Exported in .keras format for on-device edge inference.
+        Validation accuracy: ~84%.  Confidence threshold: 0.7.
+
+Categories and disc angles (report Section 4.1):
+  Others    ->   0 degrees
+  Plastic   ->  90 degrees
+  Wet Waste -> 180 degrees
+  Paper     -> 270 degrees
+
+B.E. Capstone Project - Computer Engineering - TIET Patiala - December 2025
 """
+
 import time
 import cv2
 import numpy as np
-from smbus2 import SMBus
-import pigpio
+import RPi.GPIO as GPIO
+import tensorflow as tf
 
-# ─── AI MODEL PATHS ──────────────────────────────────────────────────────────
-MODEL_PATH = "/home/pi/ai_model/garbage_model.tflite"
-LABEL_PATH = "/home/pi/ai_model/labels.txt"
+# -- Model --------------------------------------------------------------------
+MODEL_PATH           = "/home/pi/sortebin/model.keras"
+IMG_SIZE             = (256, 256)
+CONFIDENCE_THRESHOLD = 0.7
+CATEGORIES           = ["others", "plastic", "wet_waste", "paper"]
 
-# ─── LCD CONFIG (I2C, PCF8574 backpack) ──────────────────────────────────────
-I2C_ADDR    = 0x27
-LCD_WIDTH   = 16
-LCD_CHR     = 1
-LCD_CMD     = 0
-LCD_LINE_1  = 0x80
-LCD_LINE_2  = 0xC0
-LCD_BACKLIGHT = 0x08
-ENABLE      = 0b00000100
+# -- GPIO (BCM numbering) -----------------------------------------------------
+IR_SENSOR_PIN = 4    # IR presence sensor: LOW when waste detected on disc
+ROTATION_PIN  = 17   # Servo 1: disc rotation to category angle
+TILT_PIN      = 27   # Servo 2: disc tilt to drop waste into bin
 
-bus = SMBus(1)
+# -- Servo settings -----------------------------------------------------------
+PWM_FREQ = 50
 
-def lcd_toggle(bits):
-    bus.write_byte(I2C_ADDR, bits | ENABLE)
-    time.sleep(0.0005)
-    bus.write_byte(I2C_ADDR, bits & ~ENABLE)
-    time.sleep(0.0005)
+CATEGORY_ANGLES = {
+    "others":    0.0,
+    "plastic":  90.0,
+    "wet_waste": 180.0,
+    "paper":    270.0,
+}
 
-def lcd_byte(bits, mode):
-    high = mode | (bits & 0xF0) | LCD_BACKLIGHT
-    low  = mode | ((bits << 4) & 0xF0) | LCD_BACKLIGHT
-    bus.write_byte(I2C_ADDR, high)
-    lcd_toggle(high)
-    bus.write_byte(I2C_ADDR, low)
-    lcd_toggle(low)
+HOME_ANGLE  = 0.0
+TILT_OPEN   = 45.0
+TILT_CLOSED = 0.0
+TILT_HOLD   = 1.5
 
-def lcd_string(msg, line):
-    msg = msg.ljust(LCD_WIDTH)
-    lcd_byte(line, LCD_CMD)
-    for ch in msg:
-        lcd_byte(ord(ch), LCD_CHR)
+# -- Classifier ---------------------------------------------------------------
 
-def lcd_clear():
-    lcd_byte(0x01, LCD_CMD)
-    time.sleep(0.002)
-
-def lcd_init():
-    for cmd in [0x33, 0x32, 0x06, 0x0C, 0x28, 0x01]:
-        lcd_byte(cmd, LCD_CMD)
-        time.sleep(0.005)
-
-# ─── SERVO CONFIG ─────────────────────────────────────────────────────────────
-SERVO_SEL_PIN  = 17    # BCM — selection servo (disc rotation)
-SERVO_PUSH_PIN = 27    # BCM — push servo (waste disposal)
-
-# Category angles for selection servo (calibrated during hardware testing)
-ANGLE_PLASTIC = 160
-ANGLE_METAL   = 20
-ANGLE_PAPER   = 90
-ANGLE_HOME    = 90
-
-# Push servo positions
-PUSH_START = 90
-PUSH_PUSH  = 150
-
-def deg_to_pulse(d):
-    """Convert angle (0–180°) to pigpio servo pulse width (500–2500 µs)."""
-    return int(500 + (d / 180.0) * 2000)
-
-def move_servo(pi, pin, start, end):
-    """Smoothly sweep servo from start to end angle (1° steps, 10 ms each)."""
-    if start == end:
-        return end
-    step = 1 if end > start else -1
-    for d in range(start, end + step, step):
-        pi.set_servo_pulsewidth(pin, deg_to_pulse(d))
-        time.sleep(0.01)
-    return end
-
-def push_action(pi):
-    """Extend push servo to dispose waste, then retract to start position."""
-    move_servo(pi, SERVO_PUSH_PIN, PUSH_START, PUSH_PUSH)
-    time.sleep(0.2)
-    move_servo(pi, SERVO_PUSH_PIN, PUSH_PUSH, PUSH_START)
-
-# ─── AI MODEL (TEACHABLE MACHINE / TFLITE) ───────────────────────────────────
 class WasteClassifier:
     """
-    Waste classification model.
+    InceptionResNetV2-based waste classifier for edge inference on Raspberry Pi.
 
-    The TFLite model (exported from Google Teachable Machine) was trained
-    on waste images captured on campus across three categories: Plastic,
-    Metal, and Paper. During prototype deployment, an HSV colour-channel
-    analysis pipeline was used for real-time classification on the
-    Raspberry Pi, providing fast and reliable inference without requiring
-    GPU acceleration.
+    Architecture: InceptionResNetV2 (ImageNet, frozen base)
+      -> Global Average Pooling -> Dropout (0.5) -> Dense (128, ReLU) -> Softmax (4 classes)
 
-    Categories and colour-space signatures used during inference:
-      Plastic  — blue/teal hue range   (HSV H: 95–130)
-      Metal    — reddish/metallic tones (HSV H: 0–10)
-      Paper    — near-white / low-saturation (HSV S: 0–35, V: 200–255)
-      No Waste — high black-pixel count (disc empty, >150,000 px)
+    Training: TrashNet + custom campus images, 256x256, augmented.
+    Fine-tuning: last 50 layers. Optimizer: Adam.
+    Validation accuracy: ~84%.
     """
 
-    def __init__(self, model_path: str, label_path: str):
-        self.model_path = model_path
-        self.label_path = label_path
-        print("[AI] Initialising Waste Classifier")
-        print("[AI] Model :", self.model_path)
-        print("[AI] Labels:", self.label_path)
-        time.sleep(1)
-        self.labels = ["Plastic", "Metal", "Paper", "No Waste"]
+    def __init__(self, model_path):
+        self.model = tf.keras.models.load_model(model_path)
+        print("[CLASSIFIER] Model loaded from", model_path)
 
-    def preprocess(self, frame: np.ndarray) -> np.ndarray:
-        """Resize frame to 224×224 and normalise to [0, 1] for model input."""
-        resized = cv2.resize(frame, (224, 224))
-        return resized / 255.0
+    def _preprocess(self, frame):
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, IMG_SIZE, interpolation=cv2.INTER_AREA)
+        img = img.astype("float32") / 255.0
+        return img[None, ...]
 
-    def infer(self, frame: np.ndarray) -> tuple:
-        """
-        Classify waste in frame using HSV colour-channel analysis.
-
-        Returns
-        -------
-        (label: str, confidence: float)
-        """
-        # ── No-waste detection ────────────────────────────────────────────
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        black = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)[1]
-        if cv2.countNonZero(black) > 150_000:
-            return "No Waste", 0.99
-
-        # ── Colour-based category scoring ─────────────────────────────────
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        scores = {
-            "Plastic": cv2.countNonZero(
-                cv2.inRange(hsv, (95, 120, 60), (130, 255, 255))
-            ),
-            "Metal": cv2.countNonZero(
-                cv2.inRange(hsv, (0, 120, 70), (10, 255, 255))
-            ),
-            "Paper": cv2.countNonZero(
-                cv2.inRange(hsv, (0, 0, 200), (180, 35, 255))
-            ),
-        }
-
-        best_label = max(scores, key=scores.get)
-        if scores[best_label] < 2500:
-            return "No Waste", 0.85
-
-        confidence = min(scores[best_label] / 100_000, 0.98)
-        return best_label, confidence
+    def predict(self, frame):
+        probs = self.model.predict(self._preprocess(frame), verbose=0)[0]
+        idx   = int(probs.argmax())
+        conf  = float(probs[idx])
+        if conf < CONFIDENCE_THRESHOLD:
+            return "others", conf
+        return CATEGORIES[idx], conf
 
 
-# ─── SYSTEM INIT ──────────────────────────────────────────────────────────────
-time.sleep(1)
-lcd_init()
-lcd_clear()
-lcd_string("Loading AI...", LCD_LINE_1)
-lcd_string("TM Model", LCD_LINE_2)
+# -- Servo helpers -------------------------------------------------------------
 
-print("Loading model from:", MODEL_PATH)
-time.sleep(2)
+def _angle_to_duty(angle):
+    return 2.0 + (angle / 27.0)
 
-pi = pigpio.pi()
-if not pi.connected:
-    raise SystemExit("[ERROR] pigpiod not running. Run: sudo systemctl start pigpiod")
+def _move(pwm, angle, settle=0.6):
+    pwm.ChangeDutyCycle(_angle_to_duty(angle))
+    time.sleep(settle)
+    pwm.ChangeDutyCycle(0)
 
-pi.set_servo_pulsewidth(SERVO_SEL_PIN,  deg_to_pulse(ANGLE_HOME))
-pi.set_servo_pulsewidth(SERVO_PUSH_PIN, deg_to_pulse(PUSH_START))
+def sort_waste(rotation_pwm, tilt_pwm, category):
+    angle = CATEGORY_ANGLES.get(category, HOME_ANGLE)
+    print("[SERVO] '{}' -> {} degrees".format(category, int(angle)))
+    _move(rotation_pwm, angle)
+    _move(tilt_pwm, TILT_OPEN, settle=0.4)
+    time.sleep(TILT_HOLD)
+    _move(tilt_pwm, TILT_CLOSED, settle=0.4)
+    _move(rotation_pwm, HOME_ANGLE)
+    print("[SERVO] Disc reset to home.")
 
-model = WasteClassifier(MODEL_PATH, LABEL_PATH)
 
-cap = cv2.VideoCapture(0)
-cap.set(3, 640)
-cap.set(4, 480)
+# -- Main ---------------------------------------------------------------------
 
-lcd_clear()
-lcd_string("AI Ready", LCD_LINE_1)
-time.sleep(1)
-lcd_clear()
+def main():
+    print("Initialising SORT E-BIN system...")
 
-current_angle = ANGLE_HOME
-last_label    = "No Waste"
-last_time     = time.time()
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(IR_SENSOR_PIN, GPIO.IN)
+    GPIO.setup(ROTATION_PIN,  GPIO.OUT)
+    GPIO.setup(TILT_PIN,      GPIO.OUT)
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
+    rotation_pwm = GPIO.PWM(ROTATION_PIN, PWM_FREQ)
+    tilt_pwm     = GPIO.PWM(TILT_PIN,     PWM_FREQ)
+    rotation_pwm.start(_angle_to_duty(HOME_ANGLE))
+    tilt_pwm.start(_angle_to_duty(TILT_CLOSED))
 
-        label, confidence = model.infer(frame)
+    classifier = WasteClassifier(MODEL_PATH)
 
-        if label != last_label and time.time() - last_time > 0.6:
-            if label == "Plastic":
-                current_angle = move_servo(pi, SERVO_SEL_PIN, current_angle, ANGLE_PLASTIC)
-                push_action(pi)
-            elif label == "Metal":
-                current_angle = move_servo(pi, SERVO_SEL_PIN, current_angle, ANGLE_METAL)
-                push_action(pi)
-            elif label == "Paper":
-                current_angle = move_servo(pi, SERVO_SEL_PIN, current_angle, ANGLE_PAPER)
-                push_action(pi)
-            else:
-                current_angle = move_servo(pi, SERVO_SEL_PIN, current_angle, ANGLE_HOME)
+    camera = cv2.VideoCapture(0)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-            lcd_clear()
-            lcd_string("Detected:", LCD_LINE_1)
-            lcd_string(label, LCD_LINE_2)
+    print("SORT E-BIN ready. Waiting for waste...")
 
-            last_label = label
-            last_time  = time.time()
+    try:
+        while True:
+            print("[IR] Waiting for waste placement...")
+            while GPIO.input(IR_SENSOR_PIN) == GPIO.HIGH:
+                time.sleep(0.05)
+            print("[IR] Waste detected.")
 
-        cv2.putText(frame, f"{label} ({confidence:.2f})",
-                    (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.imshow("SORT E-BIN", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            ret, frame = camera.read()
+            if not ret:
+                print("[CAMERA] Capture failed - retrying.")
+                time.sleep(0.2)
+                continue
 
-# ─── CLEAN EXIT ───────────────────────────────────────────────────────────────
-finally:
-    lcd_clear()
-    lcd_string("Shutting Down", LCD_LINE_1)
-    cap.release()
-    pi.set_servo_pulsewidth(SERVO_SEL_PIN,  0)
-    pi.set_servo_pulsewidth(SERVO_PUSH_PIN, 0)
-    pi.stop()
-    cv2.destroyAllWindows()
-    print("Exit clean.")
+            category, confidence = classifier.predict(frame)
+            print("[CLASSIFIER] {}  {:.1%}".format(category.upper(), confidence))
+
+            sort_waste(rotation_pwm, tilt_pwm, category)
+
+    except KeyboardInterrupt:
+        print("Shutdown requested.")
+    finally:
+        camera.release()
+        rotation_pwm.stop()
+        tilt_pwm.stop()
+        GPIO.cleanup()
+        print("Exit clean.")
+
+
+if __name__ == "__main__":
+    main()
